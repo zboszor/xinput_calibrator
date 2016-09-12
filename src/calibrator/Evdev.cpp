@@ -26,6 +26,7 @@
 
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
+#include <X11/extensions/XInput2.h>
 #include <ctype.h>
 #include <cstdio>
 #include <cstring>
@@ -47,6 +48,7 @@ CalibratorEvdev::CalibratorEvdev(const char* const device_name0,
                                  const int thr_doubleclick,
                                  const OutputType output_type,
                                  const char* geometry,
+                                 const bool use_valuator,
                                  const bool use_timeout,
                                  const char* output_filename)
   : Calibrator(device_name0, axys0, thr_misclick, thr_doubleclick, output_type, geometry, use_timeout, output_filename)
@@ -99,6 +101,53 @@ CalibratorEvdev::CalibratorEvdev(const char* const device_name0,
             XCloseDevice(display, dev);
             XCloseDisplay(display);
             throw WrongCalibratorException("Evdev: invalid \"Evdev Axis Calibration\" property format");
+
+        } else if (use_valuator) {
+            int ndevices = 0, i, j;
+            XIDeviceInfo *info = XIQueryDevice(display, device_id, &ndevices);
+
+            if (ndevices != 1) {
+                XCloseDevice(display, dev);
+                XCloseDisplay(display);
+                throw WrongCalibratorException("Evdev: unknown Xinput device ID???");
+            }
+
+            for (i = 0; i < ndevices; i++) {
+                XIDeviceInfo *dev = &info[i];
+
+                for (j = 0; j < dev->num_classes; j++) {
+                    switch(dev->classes[i]->type) {
+                    case XIValuatorClass:
+                    {
+                        XIValuatorClassInfo *v = (XIValuatorClassInfo*)dev->classes[i];
+
+                        /* Valuator 0 = X, Valuator 1 = Y, others are ignored */
+                        switch (v->number) {
+                        case 0:
+                            old_axys.x.min = v->min;
+                            old_axys.x.max = v->max;
+                            old_axys.x.invert = false;
+                            break;
+                        case 1:
+                            old_axys.y.min = v->min;
+                            old_axys.y.max = v->max;
+                            old_axys.y.invert = false;
+                            break;
+                        default:
+                            break;
+                        }
+                        break;
+                    }
+                    default:
+                        break;
+                    }
+                }
+            }
+            XIFreeDeviceInfo(info);
+
+            if (verbose)
+                printf("DEBUG: Evdev Axis Calibration set to axis valuators\n");
+            (void) set_calibration(old_axys);
 
         } else if (nitems == 0) {
             if (verbose)
@@ -167,6 +216,7 @@ CalibratorEvdev::CalibratorEvdev(const char* const device_name0,
                                  const int thr_doubleclick,
                                  const OutputType output_type,
                                  const char* geometry,
+                                 const bool use_valuator,
                                  const bool use_timeout,
                                  const char* output_filename)
   : Calibrator(device_name0, axys0, thr_misclick, thr_doubleclick, output_type, geometry, output_filename) { }
@@ -189,13 +239,30 @@ bool CalibratorEvdev::finish(int width, int height)
     // based on old_axys: inversion/swapping is relative to the old axis
     XYinfo new_axis(old_axys);
 
+    // Calculate average of clicks.
+    // Set min and max values depending on the sequence of the clicked coordinates.
+    // If first two clicks have different x coordinates, we have a 0 or 180
+    // degrees rotation else we have a 70 or 270 degrees rotation.
+    float x_min;
+    float x_max;
+    float y_min;
+    float y_max;
+    if(abs(clicked.x[UL] - clicked.x[LL]) < abs(clicked.x[UL] - clicked.x[UR])) {
+        // rotation of 0 or 180 degrees
+        x_min = (clicked.x[UL] + clicked.x[LL])/2.0;
+        x_max = (clicked.x[UR] + clicked.x[LR])/2.0;
+        y_min = (clicked.y[UL] + clicked.y[UR])/2.0;
+        y_max = (clicked.y[LL] + clicked.y[LR])/2.0;
+    } else {
+        // rotation of 90 or 270 degreees
+        x_min = (clicked.x[UL] + clicked.x[UR])/2.0;
+        x_max = (clicked.x[LL] + clicked.x[LR])/2.0;
+        y_min = (clicked.y[UL] + clicked.y[LL])/2.0;
+        y_max = (clicked.y[UR] + clicked.y[LR])/2.0;
 
-    // calculate average of clicks
-    float x_min = (clicked.x[UL] + clicked.x[LL])/2.0;
-    float x_max = (clicked.x[UR] + clicked.x[LR])/2.0;
-    float y_min = (clicked.y[UL] + clicked.y[UR])/2.0;
-    float y_max = (clicked.y[LL] + clicked.y[LR])/2.0;
-
+        // axes are swapped on 90 or 270 degrees rotation
+        new_axis.swap_xy = !old_axys.swap_xy;
+    }
 
     // When evdev detects an invert_X/Y option,
     // it performs the following *crazy* code just before returning
@@ -217,14 +284,6 @@ bool CalibratorEvdev::finish(int width, int height)
     }
     // end of evdev inversion crazyness
 
-
-    // Should x and y be swapped?
-    if (abs(clicked.x[UL] - clicked.x[UR]) < abs(clicked.y[UL] - clicked.y[UR])) {
-        new_axis.swap_xy = !new_axis.swap_xy;
-        std::swap(x_min, y_min);
-        std::swap(x_max, y_max);
-    }
-
     // the screen was divided in num_blocks blocks, and the touch points were at
     // one block away from the true edges of the screen.
     const float block_x = width/(float)num_blocks;
@@ -238,7 +297,7 @@ bool CalibratorEvdev::finish(int width, int height)
     float scale_y = (y_max - y_min)/(height - 2*block_y);
     y_min -= block_y * scale_y;
     y_max += block_y * scale_y;
-    
+
     // now, undo the transformations done by the X server, to obtain the true 'raw' value in X.
     // The raw value was scaled from old_axis to the device min/max, and from the device min/max
     // to the screen min/max
@@ -248,10 +307,19 @@ bool CalibratorEvdev::finish(int width, int height)
     y_min = scaleAxis(y_min, old_axys.y.max, old_axys.y.min, height, 0);
     y_max = scaleAxis(y_max, old_axys.y.max, old_axys.y.min, height, 0);
 
+    // If we swapped axes also swap x and y values
+    if(new_axis.swap_xy != old_axys.swap_xy) {
+        std::swap(x_min, y_min);
+        std::swap(x_max, y_max);
+    }
 
     // round and put in new_axis struct
     new_axis.x.min = round(x_min); new_axis.x.max = round(x_max);
     new_axis.y.min = round(y_min); new_axis.y.max = round(y_max);
+
+    if (output_type == OUTYPE_CALIBRATOR) {
+        output_restore_file(width, height);
+    }
 
     // finish the data, driver/calibrator specific
     return finish_data(new_axis);
@@ -280,6 +348,10 @@ bool CalibratorEvdev::finish_data(const XYinfo &new_axys)
     // close
     XSync(display, False);
 
+    // skip saving if restore
+    if (restore_filename != NULL)
+        return true;
+
     printf("\t--> Making the calibration permanent <--\n");
     switch (output_type) {
         case OUTYPE_AUTO:
@@ -298,6 +370,9 @@ bool CalibratorEvdev::finish_data(const XYinfo &new_axys)
             break;
         case OUTYPE_XINPUT:
             success &= output_xinput(new_axys);
+            break;
+        case OUTYPE_CALIBRATOR:
+            // skip saving for this type
             break;
         default:
             fprintf(stderr, "ERROR: Evdev Calibrator does not support the supplied --output-type\n");
